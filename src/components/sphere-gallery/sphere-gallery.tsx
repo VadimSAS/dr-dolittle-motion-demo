@@ -385,6 +385,7 @@ function PostProcessing({ surface, children, strength, active }: PostProcessingP
             5,
             delta,
         )
+        screen.material.uMotionStrength = strength === 0 ? 0 : 0.4
 
         const cameraZ = camera.position.z
         const previousZ = motion.current.previousZ
@@ -750,7 +751,7 @@ function SphereScene({
     const textures = useTexture(sources)
     useEffect(() => () => {
         textures.forEach(texture => texture.dispose())
-        sources.forEach(source => useTexture.clear(source))
+        useTexture.clear(sources)
     }, [textures, sources])
     const camera = useThree((state) => state.camera)
     const size = useThree((state) => state.size)
