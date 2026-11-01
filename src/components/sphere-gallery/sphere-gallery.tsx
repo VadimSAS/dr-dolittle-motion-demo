@@ -11,6 +11,7 @@ import {
     useCallback,
     useEffect,
     useLayoutEffect,
+    useImperativeHandle,
     useMemo,
     useRef,
     useState,
@@ -45,6 +46,7 @@ const DEFAULT_PROPS = {
     focusDuration: 1,
     focusScale: 1.7,
     mouseParallax: 0.2,
+    inertia: true,
 }
 
 type LayoutTile = {
@@ -65,6 +67,7 @@ type TileProps = {
     ready: boolean
     interactive: boolean
     setPointer: (on: boolean) => void
+    onHover?: (hovered: boolean) => void
     onSelect: () => void
 } & Pick<
     typeof DEFAULT_PROPS,
@@ -102,6 +105,7 @@ type SphereSceneProps = {
     onNavigate: (index: number) => void
     onDismiss: () => void
     onReady?: () => void
+    onHover?: (index: number | null) => void
 } & Omit<typeof DEFAULT_PROPS, "lensBlur">
 
 export type SphereGalleryItem = {
@@ -109,7 +113,11 @@ export type SphereGalleryItem = {
     alt: string
 }
 
+export type SphereGalleryApi = { select: (index: number) => void; dismiss: () => void }
+
 export type SphereGalleryProps = {
+    apiRef?: RefObject<SphereGalleryApi | null>
+    onHover?: (index: number | null) => void
     items: SphereGalleryItem[]
     className?: string
     onActiveChange?: (index: number | null) => void
@@ -448,6 +456,7 @@ function Tile({
     interactive,
     setPointer,
     onSelect,
+    onHover,
     reveal,
     revealDuration,
     focusDuration,
@@ -559,10 +568,12 @@ function Tile({
                 event.stopPropagation()
                 setHovered(true)
                 setPointer(!focused)
+                onHover?.(true)
             }}
             onPointerOut={() => {
                 setHovered(false)
                 setPointer(false)
+                onHover?.(false)
             }}
         >
             <planeGeometry args={[tile.width, tile.height, 24, 24]} />
@@ -570,7 +581,7 @@ function Tile({
                 key={TileMaterial.key}
                 uMap={texture}
                 uDissolve={0}
-                uReveal={0}
+                uReveal={reveal ? 0 : 1}
                 uLatitude={tile.latitude}
                 uAngularSpan={tile.span}
                 uImageAspect={image.width / image.height}
@@ -700,6 +711,7 @@ function SphereScene({
     onNavigate,
     onDismiss,
     onReady,
+    onHover,
     rows,
     columns,
     latitudeRange,
@@ -714,8 +726,9 @@ function SphereScene({
     focusDuration,
     focusScale,
     mouseParallax,
+    inertia,
 }: SphereSceneProps) {
-    const [revealComplete, setRevealComplete] = useState(false)
+    const [revealComplete, setRevealComplete] = useState(!reveal)
     const interactive = !reveal || revealComplete
     const orientation = useRef({
         spin: 0,
@@ -727,11 +740,18 @@ function SphereScene({
     const parallax = useRef(new THREE.Vector2())
     const dragMoved = useRef(false)
     const dragging = useRef(false)
+    const velocity = useRef(new THREE.Vector2())
     const pointerOnTile = useRef(false)
     const animating = useRef(false)
     const groupRef = useRef<THREE.Group>(null)
     const sphereMaterialRef = useRef<THREE.MeshBasicMaterial>(null)
+    const savedView = useRef<{spin:number; tilt:number; z:number} | null>(null)
+    const zoom = useRef(SCENE_DISTANCE as number)
     const textures = useTexture(sources)
+    useEffect(() => () => {
+        textures.forEach(texture => texture.dispose())
+        sources.forEach(source => useTexture.clear(source))
+    }, [textures, sources])
     const camera = useThree((state) => state.camera)
     const size = useThree((state) => state.size)
     const ready = useWebglReady({ onReady })
@@ -847,10 +867,21 @@ function SphereScene({
         const element = surface.current
         if (!element || !interactive) return
 
-        const drag = { active: false, x: 0, y: 0, spin: 0, tilt: 0 }
+        const drag = { active: false, x: 0, y: 0, spin: 0, tilt: 0, time: 0 }
+        const points = new Map<number, THREE.Vector2>()
+        let pinch: {distance:number; zoom:number} | null = null
         const DRAG_THRESHOLD = 6
 
         const beginDrag = (event: PointerEvent) => {
+            points.set(event.pointerId, new THREE.Vector2(event.clientX, event.clientY))
+            velocity.current.set(0, 0)
+            drag.time = event.timeStamp
+            if (points.size === 2) {
+                const [a,b] = [...points.values()]
+                pinch = {distance: a.distanceTo(b), zoom: zoom.current}
+                dragMoved.current = true
+                return
+            }
             drag.active = true
             drag.x = event.clientX
             drag.y = event.clientY
@@ -860,6 +891,13 @@ function SphereScene({
         }
 
         const rotate = (event: PointerEvent) => {
+            if (points.has(event.pointerId)) points.set(event.pointerId, new THREE.Vector2(event.clientX,event.clientY))
+            if (points.size === 2 && pinch && activeTile === null) {
+                const [a,b] = [...points.values()]
+                zoom.current = MathUtils.clamp(pinch.zoom - (a.distanceTo(b)-pinch.distance)*0.002,-0.35,0.55)
+                dragMoved.current = true
+                return
+            }
             const rect = element.getBoundingClientRect()
 
             pointerOffset.current.set(
@@ -884,26 +922,58 @@ function SphereScene({
             }
             const width = element.offsetWidth
 
+            const previousSpin = orientation.targetSpin
+            const previousTilt = orientation.targetTilt
             orientation.targetSpin = drag.spin - (deltaX / width) * TAU
             orientation.targetTilt = MathUtils.clamp(
                 drag.tilt - (deltaY / width) * Math.PI,
                 -MAX_TILT,
                 MAX_TILT,
             )
+            const elapsed = Math.max(0.016, (event.timeStamp-drag.time)/1000)
+            velocity.current.set(
+                MathUtils.clamp((orientation.targetSpin-previousSpin)/elapsed,-3,3),
+                MathUtils.clamp((orientation.targetTilt-previousTilt)/elapsed,-2,2),
+            )
+            drag.time = event.timeStamp
         }
 
-        const endDrag = () => {
+        const keyboard = (event: KeyboardEvent) => {
+            if (activeTile !== null) return
+            const step = 0.16
+            if (event.key === 'ArrowLeft') orientation.targetSpin -= step
+            else if (event.key === 'ArrowRight') orientation.targetSpin += step
+            else if (event.key === 'ArrowUp') orientation.targetTilt = Math.max(-MAX_TILT, orientation.targetTilt-step)
+            else if (event.key === 'ArrowDown') orientation.targetTilt = Math.min(MAX_TILT, orientation.targetTilt+step)
+            else if (event.key === '+' || event.key === '=') zoom.current = Math.max(-0.35, zoom.current-0.06)
+            else if (event.key === '-') zoom.current = Math.min(0.55, zoom.current+0.06)
+            else return
+            event.preventDefault()
+        }
+        const wheel = (event: WheelEvent) => {
+            if (activeTile !== null) return
+            event.preventDefault()
+            zoom.current = MathUtils.clamp(zoom.current + event.deltaY*0.0006, -0.35, 0.55)
+        }
+        const endDrag = (event: PointerEvent) => {
+            points.delete(event.pointerId)
+            pinch = null
+            if (event.timeStamp-drag.time > 100 || event.type === 'pointercancel') velocity.current.set(0,0)
             drag.active = false
             dragging.current = false
             element.style.cursor = pointerOnTile.current ? "pointer" : ""
         }
 
+        element.addEventListener("keydown", keyboard)
+        element.addEventListener("wheel", wheel, { passive: false })
         element.addEventListener("pointerdown", beginDrag)
         window.addEventListener("pointermove", rotate)
         window.addEventListener("pointerup", endDrag)
         window.addEventListener("pointercancel", endDrag)
 
         return () => {
+            element.removeEventListener("keydown", keyboard)
+            element.removeEventListener("wheel", wheel)
             element.removeEventListener("pointerdown", beginDrag)
             window.removeEventListener("pointermove", rotate)
             window.removeEventListener("pointerup", endDrag)
@@ -989,6 +1059,16 @@ function SphereScene({
             let parallaxX = pointerOffset.current.x * mouseParallax
             let parallaxY = pointerOffset.current.y * mouseParallax
 
+            if (focused && savedView.current === null) {
+                velocity.current.set(0,0)
+                savedView.current = {spin: orientation.spin, tilt: orientation.tilt, z: zoom.current}
+            }
+            if (!focused && savedView.current) {
+                spinAngle = savedView.current.spin
+                tiltAngle = savedView.current.tilt
+                zDistance = savedView.current.z
+                savedView.current = null
+            }
             if (focused) {
                 const spin = focused.longitude + Math.PI / 2
                 spinAngle = spin + Math.round((group.rotation.y - spin) / TAU) * TAU
@@ -1045,6 +1125,13 @@ function SphereScene({
         if (!group) return
 
         if (revealComplete && activeTile === null && !animating.current) {
+            if (!inertia) velocity.current.set(0,0)
+            if (!dragging.current && inertia) {
+                orientation.targetSpin += velocity.current.x * delta
+                orientation.targetTilt = MathUtils.clamp(orientation.targetTilt + velocity.current.y * delta, -MAX_TILT, MAX_TILT)
+                velocity.current.multiplyScalar(Math.exp(-7 * delta))
+            }
+            camera.position.z = MathUtils.damp(camera.position.z, zoom.current, 8, delta)
             orientation.spin = MathUtils.damp(orientation.spin, orientation.targetSpin, 12, delta)
             orientation.tilt = MathUtils.damp(orientation.tilt, orientation.targetTilt, 12, delta)
 
@@ -1098,6 +1185,7 @@ function SphereScene({
                     ready={ready}
                     interactive={interactive}
                     setPointer={setPointer}
+                    onHover={(hovered) => onHover?.(hovered ? i % sources.length : null)}
                     onSelect={() => select(i)}
                     reveal={reveal}
                     revealDuration={revealDuration}
@@ -1127,6 +1215,8 @@ function SphereScene({
  * Takes the images, the overlay slot and renders the WebGL scene.
  */
 export function SphereGallery({
+    apiRef,
+    onHover,
     items,
     className,
     onActiveChange,
@@ -1138,6 +1228,7 @@ export function SphereGallery({
     ...rest
 }: SphereGalleryProps) {
     const surface = useRef<ComponentRef<"div">>(null)
+    const sources = useMemo(() => items.map(image => image.src), [items])
     const { lensBlur, ...sceneProps } = { ...DEFAULT_PROPS, ...rest }
     const [activeTile, setActiveTile] = useState<number | null>(null)
 
@@ -1150,6 +1241,8 @@ export function SphereGallery({
     const dismiss = useCallback(() => {
         setActiveTile(null)
     }, [])
+
+    useImperativeHandle(apiRef, () => ({select: setActiveTile, dismiss}), [dismiss])
 
     useEffect(() => {
         onActiveChange?.(allyIndex)
@@ -1167,7 +1260,7 @@ export function SphereGallery({
     }, [dismiss])
 
     return (
-        <div ref={surface} className={`touch-none select-none ${className ?? ""}`}>
+        <div ref={surface} tabIndex={0} role="region" aria-label="Сфера пациентов. Стрелки — вращение, плюс и минус — масштаб. Выберите историю в списке ниже." className={`touch-none select-none ${className ?? ""}`}>
             {/* Basic SEO/accessibility layer */}
             <ul className="sr-only">
                 {items.map((image, index) => (
@@ -1180,7 +1273,7 @@ export function SphereGallery({
                                 else select(index)
                             }}
                         >
-                            <img src={image.src} alt={image.alt} />
+                            <img src={image.src} alt={image.alt} loading="lazy" />
                         </button>
                     </li>
                 ))}
@@ -1201,7 +1294,8 @@ export function SphereGallery({
                     >
                         <SphereScene
                             {...sceneProps}
-                            sources={items.map((image) => image.src)}
+                            sources={sources}
+                            onHover={onHover}
                             surface={surface}
                             activeTile={activeTile}
                             onSelect={select}
